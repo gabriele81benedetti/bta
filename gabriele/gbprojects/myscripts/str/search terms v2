@@ -1,0 +1,104 @@
+/**
+ * Google Ads Script: Outputs a mapping of Keyword | Match Type | Search Term | Impressions | Clicks | Cost for a specific campaign.
+ * Only includes data from the campaign 'inserted'.
+ * Ignores ad groups and other columns. Merges all data into a single sheet.
+ * Follows mega-prompt best practices for GAQL and error handling.
+ */
+
+const SHEET_URL = 'https://docs.google.com/spreadsheets/d/1PWMlY_pKbjNLojRkcX_WfCWKtyjcuWpZ7xyQKJL4vkk/edit';
+const TAB = 'Keyword-SearchTerm';
+
+// Campaign name to analyze
+const CAMPAIGN_NAME = 'WMF-BP-S-ALWAYS ON'; // <-- Change this value as needed
+
+// Number of days to analyze
+const DAYS_TO_ANALYZE = 60; // <-- Change this value as needed
+
+// Utility to generate GAQL date range string for arbitrary days
+function getDateRange(numDays) {
+  const endDate = new Date();
+  const startDate = new Date();
+  startDate.setDate(endDate.getDate() - numDays);
+  const format = date => Utilities.formatDate(date, AdsApp.currentAccount().getTimeZone(), 'yyyy-MM-dd');
+  return `segments.date BETWEEN '${format(startDate)}' AND '${format(endDate)}'`;
+}
+
+const DATE_RANGE = getDateRange(DAYS_TO_ANALYZE);
+
+const QUERY = `
+SELECT 
+  segments.keyword.info.text,
+  segments.keyword.info.match_type,
+  search_term_view.search_term,
+  metrics.impressions,
+  metrics.clicks,
+  metrics.cost_micros
+FROM search_term_view
+WHERE ${DATE_RANGE}
+  AND campaign.name = '${CAMPAIGN_NAME}'
+ORDER BY metrics.impressions DESC, metrics.cost_micros DESC
+`;
+
+function main() {
+  try {
+    // Open or create the sheet
+    let ss;
+    if (!SHEET_URL) {
+      ss = SpreadsheetApp.create('Keyword-SearchTerm Mapping');
+      Logger.log('No SHEET_URL found, so this sheet was created: ' + ss.getUrl());
+    } else {
+      ss = SpreadsheetApp.openByUrl(SHEET_URL);
+    }
+    const sheet = ss.getSheetByName(TAB) || ss.insertSheet(TAB);
+    sheet.clear();
+
+    // Write headers
+    const headers = ['Keyword', 'Match Type', 'Search Term', 'Impressions', 'Clicks', 'Cost'];
+    const rows = [headers];
+
+    // Log the structure of the first row for debugging (mega-prompt best practice)
+    const sampleQuery = QUERY + ' LIMIT 1';
+    const sampleRows = AdsApp.search(sampleQuery);
+    if (sampleRows.hasNext()) {
+      const sampleRow = sampleRows.next();
+      Logger.log('Sample row structure: ' + JSON.stringify(sampleRow));
+    } else {
+      Logger.log('No rows returned for sample query.');
+    }
+
+    // Query Google Ads for keyword-search term mapping
+    const results = AdsApp.search(QUERY);
+    let rowCount = 0;
+    let foundAny = false;
+    while (results.hasNext()) {
+      try {
+        const row = results.next();
+        const keyword = row.segments && row.segments.keyword && row.segments.keyword.info ? row.segments.keyword.info.text : '';
+        const matchType = row.segments && row.segments.keyword && row.segments.keyword.info ? row.segments.keyword.info.matchType : '';
+        const searchTerm = row.searchTermView ? row.searchTermView.searchTerm : '';
+        const impressions = row.metrics ? Number(row.metrics.impressions) || 0 : 0;
+        const clicks = row.metrics ? Number(row.metrics.clicks) || 0 : 0;
+        const cost = row.metrics ? (Number(row.metrics.costMicros) || 0) / 1000000 : 0;
+        if (keyword && matchType && searchTerm) {
+          rows.push([keyword, matchType, searchTerm, impressions, clicks, cost]);
+          rowCount++;
+          foundAny = true;
+        }
+      } catch (e) {
+        Logger.log('Error processing row: ' + e + ' | Row data: ' + JSON.stringify(row));
+        // Continue with next row
+      }
+    }
+    if (!foundAny) {
+      Logger.log('No data found for campaign name: ' + CAMPAIGN_NAME + '. Please check that the campaign name is correct and exists in the account.');
+    }
+    Logger.log('Rows found: ' + rowCount);
+    if (rows.length > 1) {
+      sheet.getRange(1, 1, rows.length, headers.length).setValues(rows);
+      sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+    }
+  } catch (e) {
+    Logger.log('Error: ' + e.message);
+    throw new Error('Failed to process keyword-search term mapping.');
+  }
+}

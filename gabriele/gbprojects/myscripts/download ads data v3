@@ -1,0 +1,166 @@
+/*ID client
+YOUR_CLIENT_ID_HERE.apps.googleusercontent.com
+
+Client secret
+YOUR_CLIENT_SECRET_HERE
+
+Token sviluppatore
+YOUR_DEVELOPER_TOKEN_HERE
+*/
+
+
+// --- CONFIGURATION ---
+const CONFIG = {
+  SPREADSHEET_URL: 'https://docs.google.com/spreadsheets/d/1rTCukxqanOXLthLbsOJV-1MvBrh7gnu1hx-33fyzWj0/edit?gid=0#gid=0', // <-- Your Google Sheet URL
+  SHEET_NAME: 'Google Ads',
+  CUSTOMER_ID: '2891296975', // <-- Your Google Ads Customer ID (no dashes)
+  CLIENT_ID: 'YOUR_CLIENT_ID_HERE.apps.googleusercontent.com', // <-- OAuth2 Client ID
+  CLIENT_SECRET: 'YOUR_CLIENT_SECRET_HERE', // <-- OAuth2 Client Secret
+  DEVELOPER_TOKEN: 'YOUR_DEVELOPER_TOKEN_HERE', // <-- Google Ads Developer Token
+  // --- SET THE NUMBER OF DAYS TO LOOK BACK ---
+  // Change this value to set how many days in the past you want to fetch data for.
+  DAYS_LOOKBACK: 30 // <-- Set your desired lookback period here
+};
+
+// --- OAUTH2 SERVICE SETUP ---
+function getOAuthService() {
+  return OAuth2.createService('GoogleAds')
+    .setAuthorizationBaseUrl('https://accounts.google.com/o/oauth2/auth')
+    .setTokenUrl('https://oauth2.googleapis.com/token')
+    .setClientId(CONFIG.CLIENT_ID)
+    .setClientSecret(CONFIG.CLIENT_SECRET)
+    .setCallbackFunction('authCallback')
+    .setPropertyStore(PropertiesService.getUserProperties())
+    .setScope('https://www.googleapis.com/auth/adwords');
+}
+
+// --- AUTHORIZATION FLOW ---
+function authorize() {
+  var service = getOAuthService();
+  if (!service.hasAccess()) {
+    var authorizationUrl = service.getAuthorizationUrl();
+    Logger.log('Open the following URL and complete the authorization flow, then re-run the script: %s', authorizationUrl);
+  } else {
+    Logger.log('Already authorized. You can run fetchAndWriteGoogleAdsData().');
+  }
+}
+
+function authCallback(request) {
+  var service = getOAuthService();
+  var isAuthorized = service.handleCallback(request);
+  if (isAuthorized) {
+    return HtmlService.createHtmlOutput('Success! You can close this tab.');
+  } else {
+    return HtmlService.createHtmlOutput('Denied. You can close this tab');
+  }
+}
+
+// --- MAIN FUNCTION: FETCH DATA AND WRITE TO SHEET ---
+function fetchAndWriteGoogleAdsData() {
+  var service = getOAuthService();
+  if (!service.hasAccess()) {
+    Logger.log('No access. Run authorize() first.');
+    return;
+  }
+  var accessToken = service.getAccessToken();
+  var url = 'https://googleads.googleapis.com/v20/customers/' + CONFIG.CUSTOMER_ID + '/googleAds:search';
+  // --- GOOGLE ADS QUERY ---
+  // The query below uses the DAYS_LOOKBACK value from CONFIG to set the date range.
+  // You can change CONFIG.DAYS_LOOKBACK above to adjust how many days to look back.
+  var query = `
+    SELECT
+      segments.date,
+      campaign.id,
+      campaign.name,
+      metrics.cost_micros
+    FROM
+      campaign
+    WHERE
+      segments.date >= '" + getNDaysAgo(CONFIG.DAYS_LOOKBACK) + "'
+    ORDER BY
+      segments.date ASC, campaign.name ASC
+  `;
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': 'Bearer ' + accessToken,
+      'developer-token': CONFIG.DEVELOPER_TOKEN
+    },
+    payload: JSON.stringify({query: query}),
+    muteHttpExceptions: true
+  };
+  Logger.log('Requesting data from Google Ads API...');
+  var response = UrlFetchApp.fetch(url, options);
+  var content = response.getContentText();
+  Logger.log('API response: ' + content);
+  var parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (e) {
+    Logger.log('Failed to parse API response: ' + e);
+    return;
+  }
+  if (!parsed.results || !Array.isArray(parsed.results) || parsed.results.length === 0) {
+    Logger.log('No data returned from API.');
+    return;
+  }
+  // --- FILTER AND PIVOT DATA ---
+  var campaignSet = new Set();
+  var dateMap = {};
+  for (var i = 0; i < parsed.results.length; i++) {
+    var row = parsed.results[i];
+    var date = row.segments && row.segments.date ? row.segments.date : '';
+    var campaignName = row.campaign && row.campaign.name ? row.campaign.name : '';
+    var costMicros = row.metrics && row.metrics.costMicros ? Number(row.metrics.costMicros) : 0;
+    var cost = costMicros / 1e6;
+    // Filter: campaign name must contain both 'wmf' and 'commerciale' (case-insensitive)
+    var nameLower = campaignName.toLowerCase();
+    if (nameLower.indexOf('wmf') !== -1 && nameLower.indexOf('commerciale') !== -1) {
+      campaignSet.add(campaignName);
+      if (!dateMap[date]) dateMap[date] = {};
+      dateMap[date][campaignName] = (dateMap[date][campaignName] || 0) + cost;
+    }
+  }
+  var campaigns = Array.from(campaignSet).sort();
+  // --- BUILD OUTPUT ---
+  var output = [];
+  var header = ['DATA'].concat(campaigns).concat(['TOTAL COST']);
+  output.push(header);
+  var dates = Object.keys(dateMap).sort();
+  for (var d = 0; d < dates.length; d++) {
+    var date = dates[d];
+    var row = [date];
+    var total = 0;
+    for (var c = 0; c < campaigns.length; c++) {
+      var cname = campaigns[c];
+      var val = dateMap[date][cname] || 0;
+      row.push(val);
+      total += val;
+    }
+    row.push(total);
+    output.push(row);
+  }
+  Logger.log('Rows to write: ' + output.length);
+  // --- WRITE TO SHEET ---
+  var ss = SpreadsheetApp.openByUrl(CONFIG.SPREADSHEET_URL);
+  var sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.insertSheet(CONFIG.SHEET_NAME);
+  sheet.clear();
+  sheet.getRange(1, 1, output.length, output[0].length).setValues(output);
+  Logger.log('Data written to sheet successfully.');
+}
+
+// --- HELPER FUNCTION TO GET N DAYS AGO IN YYYY-MM-DD FORMAT ---
+function getNDaysAgo(n) {
+  var date = new Date();
+  date.setDate(date.getDate() - n);
+  var yyyy = date.getFullYear();
+  var mm = String(date.getMonth() + 1).padStart(2, '0');
+  var dd = String(date.getDate()).padStart(2, '0');
+  return yyyy + '-' + mm + '-' + dd;
+}
+
+// --- USAGE INSTRUCTIONS ---
+// 1. Fill in the CONFIG section above with your credentials and sheet info.
+// 2. Run authorize() and follow the link in the log to complete OAuth2.
+// 3. Run fetchAndWriteGoogleAdsData() to fetch and write data to your sheet.

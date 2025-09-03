@@ -1,0 +1,145 @@
+const GOOGLE_ADS_CONFIG = {
+  CLIENT_ID: 'YOUR_CLIENT_ID.apps.googleusercontent.com',
+  CLIENT_SECRET: 'YOUR_CLIENT_SECRET',
+  DEVELOPER_TOKEN: 'YOUR_DEVELOPER_TOKEN',
+  CUSTOMER_ID: 'YOUR_CUSTOMER_ID', // e.g., '1234567890'
+  REFRESH_TOKEN: '', // Will be set after first OAuth2 flow
+};
+
+function main() {
+  Logger.log('Opening spreadsheet: ' + CONFIG.SPREADSHEET_URL);
+  let ss = SpreadsheetApp.openByUrl(CONFIG.SPREADSHEET_URL);
+  let sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+  if (sheet) {
+    Logger.log('Found existing sheet: ' + CONFIG.SHEET_NAME);
+  } else {
+    Logger.log('Sheet not found, creating new sheet: ' + CONFIG.SHEET_NAME);
+    sheet = ss.insertSheet(CONFIG.SHEET_NAME);
+  }
+
+  Logger.log('Clearing previous data from sheet.');
+  sheet.clear();
+
+  Logger.log('Writing headers to sheet.');
+  sheet.getRange(1, 1, 1, 2).setValues([["Date", "Cost"]]);
+
+  Logger.log('Building GAQL query for date range: ' + CONFIG.DATE_RANGE);
+  const query = `
+    SELECT
+      segments.date,
+      metrics.cost_micros
+    FROM
+      customer
+    WHERE
+      segments.date DURING ${CONFIG.DATE_RANGE}
+    ORDER BY
+      segments.date ASC
+  `;
+  Logger.log('GAQL query built:\n' + query);
+
+  Logger.log('Fetching data from Google Ads...');
+  const rows = AdsApp.search(query);
+
+  let data = [];
+  let rowCount = 0;
+  let firstRowLogged = false;
+  while (rows.hasNext()) {
+    let row;
+    try {
+      row = rows.next();
+      // Log the structure of the first row for field verification
+      if (!firstRowLogged) {
+        Logger.log('Sample row structure: ' + JSON.stringify(row));
+        if (row.metrics) {
+          Logger.log('Sample metrics object: ' + JSON.stringify(row.metrics));
+        }
+        firstRowLogged = true;
+      }
+      // Defensive access and conversion
+      const date = row.segments && row.segments.date ? row.segments.date : '';
+      const costMicros = row.metrics && row.metrics.costMicros ? Number(row.metrics.costMicros) : 0;
+      const cost = costMicros / 1e6; // Convert micros to currency
+      data.push([date, cost]);
+      rowCount++;
+      if (rowCount <= 3) {
+        Logger.log('Sample row ' + rowCount + ': Date=' + date + ', Cost=' + cost);
+      }
+    } catch (e) {
+      Logger.log('Error processing row: ' + e + (row ? ' | Row data: ' + JSON.stringify(row) : ''));
+      // Continue with next row
+    }
+  }
+  Logger.log('Total rows fetched: ' + rowCount);
+
+  if (data.length > 0) {
+    Logger.log('Writing ' + data.length + ' rows to sheet (starting at row 2).');
+    sheet.getRange(2, 1, data.length, 2).setValues(data);
+    Logger.log('Data write complete.');
+  } else {
+    Logger.log('No data to write.');
+  }
+}
+
+function getOAuthService() {
+  return OAuth2.createService('GoogleAds')
+    .setAuthorizationBaseUrl('https://accounts.google.com/o/oauth2/auth')
+    .setTokenUrl('https://oauth2.googleapis.com/token')
+    .setClientId('YOUR_CLIENT_ID.apps.googleusercontent.com')
+    .setClientSecret('YOUR_CLIENT_SECRET')
+    .setCallbackFunction('authCallback')
+    .setPropertyStore(PropertiesService.getUserProperties())
+    .setScope('https://www.googleapis.com/auth/adwords');
+}
+
+function authorize() {
+  var service = getOAuthService();
+  if (!service.hasAccess()) {
+    var authorizationUrl = service.getAuthorizationUrl();
+    Logger.log('Open the following URL and re-run the script: %s', authorizationUrl);
+  } else {
+    Logger.log('Already authorized');
+  }
+}
+
+function authCallback(request) {
+  var service = getOAuthService();
+  var isAuthorized = service.handleCallback(request);
+  if (isAuthorized) {
+    return HtmlService.createHtmlOutput('Success! You can close this tab.');
+  } else {
+    return HtmlService.createHtmlOutput('Denied. You can close this tab');
+  }
+}
+
+function testGoogleAdsApi() {
+  var service = getOAuthService();
+  if (!service.hasAccess()) {
+    Logger.log('No access. Run authorize() first.');
+    return;
+  }
+  var accessToken = service.getAccessToken();
+  var url = 'https://googleads.googleapis.com/v14/customers/' + 'YOUR_CUSTOMER_ID' + '/googleAds:searchStream';
+  var query = `
+    SELECT
+      segments.date,
+      metrics.cost_micros
+    FROM
+      customer
+    WHERE
+      segments.date DURING LAST_30_DAYS
+    ORDER BY
+      segments.date ASC
+  `;
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': 'Bearer ' + accessToken,
+      'developer-token': 'YOUR_DEVELOPER_TOKEN'
+    },
+    payload: JSON.stringify({query: query}),
+    muteHttpExceptions: true
+  };
+  var response = UrlFetchApp.fetch(url, options);
+  Logger.log(response.getContentText());
+}

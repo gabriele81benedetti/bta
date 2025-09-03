@@ -1,0 +1,194 @@
+// Google Ads Search Term Keyword Consolidation Script (Refactored for flat sheet)
+// Reads: Keyword (A), Match Type (B), Search Term (C), Impressions (D), Clicks (E), Cost (F)
+// Builds keyword -> search terms mapping, finds overlapping groups, suggests consolidation
+// Outputs to 'insights' tab, with thorough logging
+
+const SHEET_URL = 'PASTE_YOUR_FULL_SPREADSHEET_URL_HERE'; // Input the full Google Spreadsheet URL here
+
+function main() {
+  Logger.log('=== STARTING SEARCH TERM ANALYZER (FLAT SHEET) ===');
+  const DATA_TAB = 'Keyword-SearchTerm'; // New flat data tab
+  const INSIGHTS_TAB = 'insights';
+  const INPUT_TAB = 'input';
+  Logger.log('Sheet URL: ' + SHEET_URL);
+  Logger.log('Data tab: ' + DATA_TAB);
+  Logger.log('Insights tab: ' + INSIGHTS_TAB);
+
+  // 1. Read data from the flat sheet
+  Logger.log('=== READING DATA FROM SPREADSHEET ===');
+  const ss = SpreadsheetApp.openByUrl(SHEET_URL);
+  const sheet = ss.getSheetByName(DATA_TAB);
+  if (!sheet) {
+    Logger.log('ERROR: Data tab not found: ' + DATA_TAB);
+    throw new Error('Sheet "' + DATA_TAB + '" not found.');
+  }
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  Logger.log('Headers found: ' + headers.join(', '));
+  Logger.log('Total rows of data: ' + (data.length - 1));
+
+  // 2. Build keyword -> search terms mapping
+  Logger.log('=== BUILDING KEYWORD MAPPING ===');
+  const kwMap = {}; // keyword -> Set of search terms
+  let processed = 0, skipped = 0;
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const keyword = row[0];
+    const matchType = row[1]; // not used in mapping, but available
+    const searchTerm = row[2];
+    if (!keyword || !searchTerm) {
+      Logger.log('Row ' + i + ': SKIPPED - missing keyword or search term');
+      skipped++;
+      continue;
+    }
+    if (!kwMap[keyword]) kwMap[keyword] = new Set();
+    kwMap[keyword].add(searchTerm);
+    processed++;
+  }
+  Logger.log('Data processing complete: ' + processed + ' rows processed, ' + skipped + ' rows skipped');
+  Logger.log('=== KEYWORD MAPPING SUMMARY ===');
+  for (const [kw, stSet] of Object.entries(kwMap)) {
+    Logger.log('Keyword: ' + kw + ', Search Terms Count: ' + stSet.size);
+  }
+
+  // 3. Build reverse: searchTerm -> [keywords]
+  const stToKw = {};
+  for (const [kw, stSet] of Object.entries(kwMap)) {
+    for (const st of stSet) {
+      if (!stToKw[st]) stToKw[st] = new Set();
+      stToKw[st].add(kw);
+    }
+  }
+
+  // 4. Find groups of keywords that share >50% of their search terms
+  Logger.log('=== FINDING OVERLAPPING KEYWORDS ===');
+  const overlapGroups = findOverlappingKeywordGroups(kwMap, stToKw);
+  Logger.log('Found ' + overlapGroups.length + ' overlapping groups');
+
+  // 5. For each group, suggest consolidation (callOpenAI if API key present)
+  Logger.log('=== PREPARING INSIGHTS OUTPUT ===');
+  const insights = [['Overlapping Keywords', 'Overlapping Search Terms', 'Suggested Consolidation']];
+  let apiKey = '';
+  try {
+    const range = ss.getRangeByName('API');
+    if (range) {
+      apiKey = range.getValue();
+      Logger.log('API key retrieved: ' + (apiKey ? 'YES' : 'NO'));
+    } else {
+      Logger.log('API key named range not found.');
+    }
+  } catch (e) {
+    Logger.log('Error retrieving API key: ' + e);
+  }
+
+  for (const group of overlapGroups) {
+    // Collect all search terms for this group
+    const searchTermsSet = new Set();
+    for (const kw of group) {
+      for (const st of kwMap[kw]) {
+        searchTermsSet.add(st);
+      }
+    }
+    const overlappingKeywords = group.join(', ');
+    const overlappingSearchTerms = Array.from(searchTermsSet).join(', ');
+    // Prepare prompt for OpenAI
+    const prompt = buildPromptForConsolidation(group, kwMap);
+    Logger.log('Prompt for OpenAI: ' + prompt);
+    let aiResponse = 'No API key';
+    if (apiKey) {
+      aiResponse = callOpenAI(prompt, apiKey);
+      Logger.log('OpenAI response: ' + aiResponse);
+    }
+    insights.push([
+      overlappingKeywords,
+      overlappingSearchTerms,
+      aiResponse
+    ]);
+  }
+
+  Logger.log('=== FINAL DATA STRUCTURES ===');
+  Logger.log('Keyword Map: ' + JSON.stringify(Object.fromEntries(Object.entries(kwMap).map(([k,v])=>[k,Array.from(v)]))));
+  Logger.log('Insights: ' + JSON.stringify(insights));
+
+  // 6. Write results to 'insights' tab
+  Logger.log('=== WRITING RESULTS TO INSIGHTS TAB ===');
+  let insightsSheet = ss.getSheetByName('insights');
+  if (!insightsSheet) insightsSheet = ss.insertSheet('insights');
+  insightsSheet.clear();
+  if (insights.length === 1) { // Only header, no data
+    insightsSheet.getRange(1, 1).setValue('No overlapping keyword groups found.');
+    Logger.log('No overlapping keyword groups found - writing message to sheet');
+    return;
+  }
+  insightsSheet.getRange(1, 1, insights.length, insights[0].length).setValues(insights);
+  Logger.log('Results written to insights tab.');
+}
+
+function findOverlappingKeywordGroups(kwMap, stToKw) {
+  // Simple greedy grouping: if two keywords share >50% of their search terms, group them
+  const keywords = Object.keys(kwMap);
+  const groups = [];
+  const used = new Set();
+  for (let i = 0; i < keywords.length; i++) {
+    if (used.has(keywords[i])) continue;
+    const group = [keywords[i]];
+    used.add(keywords[i]);
+    for (let j = i + 1; j < keywords.length; j++) {
+      if (used.has(keywords[j])) continue;
+      const setA = kwMap[keywords[i]];
+      const setB = kwMap[keywords[j]];
+      const intersection = new Set([...setA].filter(x => setB.has(x)));
+      const overlapA = intersection.size / setA.size;
+      const overlapB = intersection.size / setB.size;
+      if (overlapA > 0.5 && overlapB > 0.5) {
+        group.push(keywords[j]);
+        used.add(keywords[j]);
+      }
+    }
+    if (group.length > 1) groups.push(group);
+  }
+  return groups;
+}
+
+function buildPromptForConsolidation(group, kwMap) {
+  // Build a prompt for OpenAI to suggest a consolidated keyword
+  let prompt = `In Google Ads, the following keywords are triggering highly overlapping search terms.\n`;
+  prompt += 'Keywords:\n';
+  for (const kw of group) {
+    prompt += `- ${kw}\n`;
+    prompt += `  Search terms: ${Array.from(kwMap[kw]).join(", ")}\n`;
+  }
+  prompt += `\nSuggest a single consolidated keyword (prefer Exact match if possible, then Phrase, then Broad) that would cover all these search terms, and specify the match type. Only output the keyword and match type, nothing else.`;
+  return prompt;
+}
+
+function callOpenAI(prompt, apiKey) {
+  // Calls OpenAI API (GPT-3.5/4) with the prompt, returns the suggestion
+  const url = 'https://api.openai.com/v1/chat/completions';
+  const payload = {
+    model: 'gpt-3.5-turbo',
+    messages: [{role: 'user', content: prompt}],
+    max_tokens: 50,
+    temperature: 0.2
+  };
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'Authorization': 'Bearer ' + apiKey },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    const json = JSON.parse(response.getContentText());
+    if (json.choices && json.choices.length > 0) {
+      return json.choices[0].message.content.trim();
+    } else {
+      Logger.log('OpenAI API error: ' + response.getContentText());
+      return 'No suggestion (API error)';
+    }
+  } catch (e) {
+    Logger.log('OpenAI API call failed: ' + e);
+    return 'No suggestion (API error)';
+  }
+}

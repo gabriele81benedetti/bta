@@ -1,0 +1,60 @@
+/**
+ * Google Ads Script: Outputs a two-column mapping of Keyword | Search Term for a specific campaign.
+ * Only includes data from the campaign 'WMF-BP-S-ALWAYS ON'.
+ * Ignores ad groups and other columns. Merges all data into a single sheet.
+ */
+
+const SHEET_URL = ''; // Optional: Add your sheet URL here
+const TAB = 'Keyword-SearchTerm';
+
+const QUERY = `
+SELECT 
+  ad_group_criterion.keyword.text,
+  search_term_view.search_term
+FROM search_term_view
+WHERE segments.date DURING LAST_30_DAYS
+  AND campaign.name = 'WMF-BP-S-ALWAYS ON'
+  AND ad_group_criterion.status = 'ENABLED'
+  AND search_term_view.status = 'ENABLED'
+ORDER BY ad_group_criterion.keyword.text, search_term_view.search_term
+`;
+
+function main() {
+  try {
+    // Open or create the sheet
+    let ss;
+    if (!SHEET_URL) {
+      ss = SpreadsheetApp.create('Keyword-SearchTerm Mapping');
+      Logger.log('No SHEET_URL found, so this sheet was created: ' + ss.getUrl());
+    } else {
+      ss = SpreadsheetApp.openByUrl(SHEET_URL);
+    }
+    const sheet = ss.getSheetByName(TAB) || ss.insertSheet(TAB);
+    sheet.clear();
+
+    // Write headers
+    const headers = ['Keyword', 'Search Term'];
+    const rows = [headers];
+
+    // Query Google Ads for keyword-search term mapping
+    const results = AdsApp.search(QUERY);
+    let rowCount = 0;
+    while (results.hasNext()) {
+      const row = results.next();
+      const keyword = row.adGroupCriterion && row.adGroupCriterion.keyword ? row.adGroupCriterion.keyword.text : '';
+      const searchTerm = row.searchTermView ? row.searchTermView.searchTerm : '';
+      if (keyword && searchTerm) {
+        rows.push([keyword, searchTerm]);
+        rowCount++;
+      }
+    }
+    Logger.log('Rows found: ' + rowCount);
+    if (rows.length > 1) {
+      sheet.getRange(1, 1, rows.length, headers.length).setValues(rows);
+      sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+    }
+  } catch (e) {
+    Logger.log('Error: ' + e.message);
+    throw new Error('Failed to process keyword-search term mapping.');
+  }
+}
